@@ -2,6 +2,10 @@
 
 Monitor your Claude Pro session and weekly usage directly inside Claude Code's terminal status line — no browser extension needed.
 
+![macOS](https://img.shields.io/badge/macOS-✓_supported-brightgreen?logo=apple&logoColor=white)
+![Linux](https://img.shields.io/badge/Linux-not_yet-yellow?logo=linux&logoColor=white)
+![Windows](https://img.shields.io/badge/Windows-not_supported-lightgrey?logo=windows&logoColor=white)
+
 ![Preview](preview.png)
 
 The status line shows:
@@ -14,9 +18,19 @@ Session: 32% ███░░░░░ resets in 4h 8m  Weekly: 12% █░░░�
 
 ---
 
+## Platform support
+
+| Platform | Status | Notes |
+|---|---|---|
+| macOS | ✅ Supported | Full support via Keychain + Claude Desktop |
+| Linux | 🚧 Not yet | Claude Desktop uses `libsecret`/GNOME keyring — different API, PRs welcome |
+| Windows | ❌ Not supported | Cookie encryption uses Windows DPAPI — requires a separate implementation |
+
+---
+
 ## Requirements
 
-- macOS
+- macOS 12+
 - [Claude Desktop](https://claude.ai/download) installed and logged in
 - [Claude Code CLI](https://claude.ai/code) installed
 - Python 3 (`python3 --version`)
@@ -26,7 +40,7 @@ Session: 32% ███░░░░░ resets in 4h 8m  Weekly: 12% █░░░�
 ## Install (one command)
 
 ```bash
-git clone https://github.com/YOUR_USERNAME/claude-usage-statusline.git
+git clone https://github.com/RenzoTakada/claude-usage-statusline.git
 cd claude-usage-statusline
 bash install.sh
 ```
