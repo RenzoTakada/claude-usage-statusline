@@ -1,84 +1,321 @@
 #!/usr/bin/env python3
 """
-Claude Code status line — session & weekly usage from claude.ai
-Reads Claude Desktop cookies (macOS) and calls the usage API.
-Cache: 60s TTL in /tmp/claude_usage_cache.json
+Claude Code status line — session & weekly usage from claude.ai.
+
+Reads Claude Desktop cookies on macOS, Linux, or Windows and calls the Claude
+usage API. Cookie locations and encryption keys can be overridden with:
+
+  CLAUDE_COOKIES_DB
+  CLAUDE_LOCAL_STATE
+  CLAUDE_SAFE_STORAGE_PASSWORD
+  CLAUDE_USAGE_ORG_ID
+  CLAUDE_USAGE_CACHE_FILE
 """
 
-import hashlib, json, os, sqlite3, subprocess, sys, time, urllib.request, urllib.error
+import base64
+import ctypes
+import ctypes.wintypes
+import hashlib
+import json
+import os
+import platform
+import shutil
+import sqlite3
+import subprocess
+import sys
+import tempfile
+import time
+import urllib.error
+import urllib.request
 from datetime import datetime, timezone
-from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
-from cryptography.hazmat.backends import default_backend
+from pathlib import Path
 
-CACHE_FILE       = "/tmp/claude_usage_cache.json"
-CACHE_TTL        = 60  # seconds
-COOKIES_DB       = os.path.expanduser("~/Library/Application Support/Claude/Cookies")
+from cryptography.hazmat.backends import default_backend
+from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
+from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+
+CACHE_TTL = 60
 KEYCHAIN_SERVICE = "Claude Safe Storage"
 KEYCHAIN_ACCOUNT = "Claude"
+COOKIE_NAMES = ("sessionKey", "cf_clearance", "anthropic-device-id")
 
-# ── helpers ──────────────────────────────────────────────────────────────────
 
-def get_aes_key():
+def user_agent():
+    system = platform.system()
+    if system == "Darwin":
+        return (
+            "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
+        )
+    if system == "Windows":
+        return (
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
+        )
+    return (
+        "Mozilla/5.0 (X11; Linux x86_64) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
+    )
+
+
+def app_data_dir():
+    system = platform.system()
+    home = Path.home()
+    if system == "Darwin":
+        return home / "Library" / "Application Support" / "Claude"
+    if system == "Windows":
+        return Path(os.environ.get("APPDATA", home / "AppData" / "Roaming")) / "Claude"
+    return Path(os.environ.get("XDG_CONFIG_HOME", home / ".config")) / "Claude"
+
+
+def cookies_db_path():
+    override = os.environ.get("CLAUDE_COOKIES_DB")
+    return Path(override).expanduser() if override else app_data_dir() / "Cookies"
+
+
+def local_state_path():
+    override = os.environ.get("CLAUDE_LOCAL_STATE")
+    return Path(override).expanduser() if override else app_data_dir() / "Local State"
+
+
+def cache_file_path():
+    override = os.environ.get("CLAUDE_USAGE_CACHE_FILE")
+    if override:
+        return Path(override).expanduser()
+    return Path(tempfile.gettempdir()) / "claude_usage_cache.json"
+
+
+def derive_chromium_key(password, iterations):
+    return hashlib.pbkdf2_hmac("sha1", password.encode(), b"saltysalt", iterations=iterations, dklen=16)
+
+
+def get_macos_password():
     result = subprocess.run(
         ["security", "find-generic-password", "-s", KEYCHAIN_SERVICE, "-a", KEYCHAIN_ACCOUNT, "-w"],
-        capture_output=True, text=True
+        capture_output=True,
+        text=True,
+        check=False,
     )
     password = result.stdout.strip()
     if not password:
-        raise RuntimeError("Could not read Claude Safe Storage key from Keychain")
-    return hashlib.pbkdf2_hmac("sha1", password.encode(), b"saltysalt", iterations=1003, dklen=16)
+        raise RuntimeError("Could not read Claude Safe Storage key from macOS Keychain")
+    return password
 
-def decrypt_cookie(enc_val, aes_key):
+
+def secret_tool_lookup(*args):
+    if not shutil.which("secret-tool"):
+        return None
+    result = subprocess.run(["secret-tool", "lookup", *args], capture_output=True, text=True, check=False)
+    value = result.stdout.strip()
+    return value or None
+
+
+def get_linux_password():
+    override = os.environ.get("CLAUDE_SAFE_STORAGE_PASSWORD")
+    if override:
+        return override
+
+    lookups = [
+        ("application", "Claude"),
+        ("application", "claude"),
+        ("application", "chrome"),
+        ("application", "chromium"),
+    ]
+    for attrs in lookups:
+        value = secret_tool_lookup(*attrs)
+        if value:
+            return value
+
+    # Chromium's historical Linux fallback when no keyring is available.
+    return "peanuts"
+
+
+def dpapi_unprotect(data):
+    class DATA_BLOB(ctypes.Structure):
+        _fields_ = [
+            ("cbData", ctypes.wintypes.DWORD),
+            ("pbData", ctypes.POINTER(ctypes.c_char)),
+        ]
+
+    blob_in = DATA_BLOB(len(data), ctypes.cast(ctypes.create_string_buffer(data), ctypes.POINTER(ctypes.c_char)))
+    blob_out = DATA_BLOB()
+
+    if not ctypes.windll.crypt32.CryptUnprotectData(
+        ctypes.byref(blob_in),
+        None,
+        None,
+        None,
+        None,
+        0,
+        ctypes.byref(blob_out),
+    ):
+        raise RuntimeError("Windows DPAPI could not decrypt Claude cookie key")
+
+    try:
+        return ctypes.string_at(blob_out.pbData, blob_out.cbData)
+    finally:
+        ctypes.windll.kernel32.LocalFree(blob_out.pbData)
+
+
+def get_windows_aes_key():
+    path = local_state_path()
+    if not path.exists():
+        return None
+
+    with path.open(encoding="utf-8") as f:
+        local_state = json.load(f)
+
+    encrypted_key_b64 = local_state.get("os_crypt", {}).get("encrypted_key")
+    if not encrypted_key_b64:
+        return None
+
+    encrypted_key = base64.b64decode(encrypted_key_b64)
+    if encrypted_key.startswith(b"DPAPI"):
+        encrypted_key = encrypted_key[5:]
+    return dpapi_unprotect(encrypted_key)
+
+
+def candidate_keys():
+    system = platform.system()
+    keys = []
+
+    override = os.environ.get("CLAUDE_SAFE_STORAGE_PASSWORD")
+    if override:
+        keys.append(derive_chromium_key(override, 1003))
+
+    if system == "Darwin":
+        keys.append(derive_chromium_key(get_macos_password(), 1003))
+    elif system == "Linux":
+        password = get_linux_password()
+        iterations = 1 if password == "peanuts" else 1
+        keys.append(derive_chromium_key(password, iterations))
+    elif system == "Windows":
+        key = get_windows_aes_key()
+        if key:
+            keys.append(key)
+
+    return keys
+
+
+def decrypt_cbc(encrypted_value, key):
     iv = b" " * 16
-    ciphertext = enc_val[3:]  # strip v10 prefix
-    cipher = Cipher(algorithms.AES(aes_key), modes.CBC(iv), backend=default_backend())
-    dec = cipher.decryptor()
-    decrypted = dec.update(ciphertext) + dec.finalize()
+    ciphertext = encrypted_value[3:]
+    cipher = Cipher(algorithms.AES(key), modes.CBC(iv), backend=default_backend())
+    decryptor = cipher.decryptor()
+    decrypted = decryptor.update(ciphertext) + decryptor.finalize()
     pad_len = decrypted[-1]
     if 1 <= pad_len <= 16:
         decrypted = decrypted[:-pad_len]
-    # Chrome/OSCrypt prepends 32 bytes of binary prefix before the actual value
-    return decrypted[32:].decode("ascii", errors="replace").rstrip("\x00")
+
+    candidates = []
+    if len(decrypted) > 32:
+        candidates.append(decrypted[32:])
+    candidates.append(decrypted)
+
+    for candidate in candidates:
+        try:
+            text = candidate.decode("utf-8").rstrip("\x00")
+            if text:
+                return text
+        except UnicodeDecodeError:
+            pass
+
+    return decrypted.decode("utf-8", errors="replace").rstrip("\x00")
+
+
+def decrypt_gcm(encrypted_value, key):
+    nonce = encrypted_value[3:15]
+    ciphertext_and_tag = encrypted_value[15:]
+    return AESGCM(key).decrypt(nonce, ciphertext_and_tag, None).decode("utf-8")
+
+
+def decrypt_cookie(encrypted_value, keys):
+    if not encrypted_value:
+        return ""
+
+    if isinstance(encrypted_value, memoryview):
+        encrypted_value = encrypted_value.tobytes()
+
+    if not encrypted_value.startswith((b"v10", b"v11")):
+        if platform.system() == "Windows":
+            return dpapi_unprotect(encrypted_value).decode("utf-8")
+        return encrypted_value.decode("utf-8", errors="replace")
+
+    errors = []
+    for key in keys:
+        if len(key) in (16, 24, 32):
+            try:
+                return decrypt_gcm(encrypted_value, key)
+            except Exception as exc:
+                errors.append(exc)
+
+            try:
+                return decrypt_cbc(encrypted_value, key)
+            except Exception as exc:
+                errors.append(exc)
+
+    raise RuntimeError(f"Could not decrypt Claude cookie ({len(errors)} attempts failed)")
+
 
 def get_cookies():
-    aes_key = get_aes_key()
-    conn = sqlite3.connect(COOKIES_DB)
-    cur = conn.cursor()
-    cur.execute(
-        "SELECT name, encrypted_value FROM cookies "
-        "WHERE host_key LIKE '%claude%' "
-        "AND name IN ('sessionKey', 'cf_clearance', 'anthropic-device-id')"
-    )
+    db_path = cookies_db_path()
+    if not db_path.exists():
+        raise RuntimeError(f"Claude cookies database not found: {db_path}")
+
+    keys = candidate_keys()
+    if not keys:
+        raise RuntimeError("No cookie decryption key available for this platform")
+
+    conn = sqlite3.connect(str(db_path))
+    try:
+        cur = conn.cursor()
+        placeholders = ",".join("?" for _ in COOKIE_NAMES)
+        cur.execute(
+            "SELECT name, value, encrypted_value FROM cookies "
+            "WHERE host_key LIKE '%claude%' "
+            f"AND name IN ({placeholders})",
+            COOKIE_NAMES,
+        )
+        rows = cur.fetchall()
+    finally:
+        conn.close()
+
     cookies = {}
-    for name, enc_val in cur.fetchall():
-        if enc_val and enc_val[:3] == b"v10":
-            cookies[name] = decrypt_cookie(enc_val, aes_key)
-    conn.close()
+    for name, value, encrypted_value in rows:
+        if value:
+            cookies[name] = value
+        elif encrypted_value:
+            cookies[name] = decrypt_cookie(encrypted_value, keys)
+
     if not cookies:
-        raise RuntimeError("No Claude session cookies found — make sure Claude Desktop is installed and you are logged in")
+        raise RuntimeError("No Claude session cookies found — make sure Claude Desktop is installed and logged in")
+
     return cookies
+
 
 def make_headers(cookies):
     return {
         "Cookie": "; ".join(f"{k}={v}" for k, v in cookies.items()),
-        "User-Agent": (
-            "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
-            "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
-        ),
+        "User-Agent": user_agent(),
         "Accept": "application/json",
         "Referer": "https://claude.ai/",
     }
 
+
 def get_org_id(cookies):
-    """Auto-discover the primary org ID from the API."""
+    override = os.environ.get("CLAUDE_USAGE_ORG_ID")
+    if override:
+        return override
+
     req = urllib.request.Request("https://claude.ai/api/organizations", headers=make_headers(cookies))
     with urllib.request.urlopen(req, timeout=8) as resp:
         orgs = json.loads(resp.read())
-    # Prefer a non-personal org (has members), otherwise fall back to first
+
     for org in orgs:
         if org.get("capabilities") and "claude_pro" in org.get("capabilities", []):
             return org["uuid"]
     return orgs[0]["uuid"]
+
 
 def fetch_usage(cookies, org_id):
     url = f"https://claude.ai/api/organizations/{org_id}/usage"
@@ -86,7 +323,6 @@ def fetch_usage(cookies, org_id):
     with urllib.request.urlopen(req, timeout=8) as resp:
         return json.loads(resp.read())
 
-# ── formatting ────────────────────────────────────────────────────────────────
 
 def fmt_countdown(resets_at_iso):
     if not resets_at_iso:
@@ -97,18 +333,20 @@ def fmt_countdown(resets_at_iso):
         total_secs = int(remaining.total_seconds())
         if total_secs <= 0:
             return "soon"
-        days  = total_secs // 86400
+        days = total_secs // 86400
         hours = (total_secs % 86400) // 3600
-        mins  = (total_secs % 3600)  // 60
+        mins = (total_secs % 3600) // 60
         if days > 0:
             return f"{days}d {hours}h"
         return f"{hours}h {mins}m"
     except Exception:
         return "?"
 
+
 def bar(pct, width=8):
     filled = round(pct / 100 * width)
     return "█" * filled + "░" * (width - filled)
+
 
 def render(data):
     s5 = data.get("five_hour", {}) or {}
@@ -119,26 +357,25 @@ def render(data):
     r7 = fmt_countdown(s7.get("resets_at"))
     return f"Session: {p5:.0f}% {bar(p5)} resets in {r5}  Weekly: {p7:.0f}% {bar(p7)} resets in {r7}"
 
-# ── cache ─────────────────────────────────────────────────────────────────────
 
 def load_cache():
     try:
-        with open(CACHE_FILE) as f:
-            c = json.load(f)
-        if time.time() - c.get("ts", 0) < CACHE_TTL:
-            return c.get("output"), c.get("org_id")
+        with cache_file_path().open() as f:
+            cache = json.load(f)
+        if time.time() - cache.get("ts", 0) < CACHE_TTL:
+            return cache.get("output"), cache.get("org_id")
     except Exception:
         pass
     return None, None
 
+
 def save_cache(output, org_id):
     try:
-        with open(CACHE_FILE, "w") as f:
+        with cache_file_path().open("w") as f:
             json.dump({"ts": time.time(), "output": output, "org_id": org_id}, f)
     except Exception:
         pass
 
-# ── main ──────────────────────────────────────────────────────────────────────
 
 def main():
     cached_output, cached_org = load_cache()
@@ -148,16 +385,19 @@ def main():
 
     try:
         cookies = get_cookies()
-        org_id  = cached_org or get_org_id(cookies)
-        data    = fetch_usage(cookies, org_id)
-        output  = render(data)
-    except Exception as e:
-        output  = ""
-        org_id  = None
+        org_id = cached_org or get_org_id(cookies)
+        data = fetch_usage(cookies, org_id)
+        output = render(data)
+    except Exception as exc:
+        if os.environ.get("CLAUDE_USAGE_DEBUG"):
+            print(f"claude-usage-statusline error: {exc}", file=sys.stderr)
+        output = ""
+        org_id = None
 
     if output:
         save_cache(output, org_id)
     print(output)
+
 
 if __name__ == "__main__":
     main()
